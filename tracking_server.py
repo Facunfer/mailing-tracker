@@ -1,4 +1,16 @@
-from flask import Flask, request, send_file, jsonify
+"""
+SERVIDOR DE TRACKING — tracking_server.py  v5
+Trackea por imagen visible (mejor deteccion en Gmail que el pixel invisible).
+
+Rutas:
+  /t/<email>.gif        -> pixel invisible (fallback)
+  /img/<email>          -> registra apertura y REDIRIGE a una imagen real visible
+  /reg                  -> registrar envio (lo llama enviar.py)
+  /reporte              -> dashboard HTML
+  /exportar             -> CSV
+"""
+
+from flask import Flask, request, send_file, jsonify, redirect
 import psycopg
 from psycopg.rows import dict_row
 import io, datetime, base64, csv, os
@@ -6,6 +18,13 @@ import io, datetime, base64, csv, os
 app = Flask(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# URL de la imagen real que se va a mostrar como cabecera del mail.
+# Cambiala por la URL de tu imagen de cabecera del resumen (de Mailchimp).
+IMAGEN_CABECERA = os.environ.get(
+    "IMAGEN_CABECERA",
+    "https://via.placeholder.com/600x200?text=Resumen+Mensual"
+)
 
 def get_db():
     return psycopg.connect(DATABASE_URL)
@@ -28,14 +47,7 @@ def init_db():
             )""")
         conn.commit()
 
-# ── Pixel de tracking ─────────────────────────────────────────────────────────
-
-@app.route("/t/<eid>.gif")
-def pixel(eid):
-    try:
-        email = base64.urlsafe_b64decode(eid + "==").decode()
-    except Exception:
-        email = eid
+def registrar_apertura(email):
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -47,6 +59,28 @@ def pixel(eid):
             conn.commit()
     except Exception:
         pass
+
+def decode_email(eid):
+    try:
+        return base64.urlsafe_b64decode(eid + "==").decode()
+    except Exception:
+        return eid
+
+# ── Imagen visible que trackea (RECOMENDADO) ──────────────────────────────────
+
+@app.route("/img/<eid>")
+def img_track(eid):
+    email = decode_email(eid)
+    registrar_apertura(email)
+    # Redirige a la imagen real -> el mail muestra la cabecera y vos trackeas
+    return redirect(IMAGEN_CABECERA, code=302)
+
+# ── Pixel invisible (fallback) ────────────────────────────────────────────────
+
+@app.route("/t/<eid>.gif")
+def pixel(eid):
+    email = decode_email(eid)
+    registrar_apertura(email)
     gif = bytes([
         0x47,0x49,0x46,0x38,0x39,0x61,0x01,0x00,0x01,0x00,0x80,0x00,
         0x00,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x21,0xF9,0x04,0x00,0x00,
@@ -55,7 +89,7 @@ def pixel(eid):
     ])
     return send_file(io.BytesIO(gif), mimetype="image/gif")
 
-# ── Registrar envío ───────────────────────────────────────────────────────────
+# ── Registrar envio ───────────────────────────────────────────────────────────
 
 @app.route("/reg", methods=["POST"])
 def registrar():
@@ -80,13 +114,9 @@ def reporte():
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT COUNT(*) AS c FROM envios")
             total = cur.fetchone()["c"]
-
             cur.execute("""
-                SELECT
-                    e.email,
-                    MIN(e.nombre)     AS nombre,
-                    COUNT(a.id)       AS veces,
-                    MIN(a.abierto_en) AS primera
+                SELECT e.email, MIN(e.nombre) AS nombre,
+                       COUNT(a.id) AS veces, MIN(a.abierto_en) AS primera
                 FROM envios e
                 LEFT JOIN aperturas a ON lower(e.email) = lower(a.email)
                 GROUP BY e.email
@@ -105,20 +135,14 @@ def reporte():
         veces   = r["veces"]
         primera = r["primera"].strftime("%Y-%m-%d %H:%M:%S") if r["primera"] else ""
         if veces > 0:
-            rows_html += (
-                f'<tr><td>{email}</td><td>{nombre}</td>'
-                f'<td class="si">✓ Sí</td>'
-                f'<td><span class="badge">{veces}x</span></td>'
-                f'<td>{primera}</td></tr>'
-            )
+            rows_html += (f'<tr><td>{email}</td><td>{nombre}</td>'
+                          f'<td class="si">✓ Sí</td><td><span class="badge">{veces}x</span></td>'
+                          f'<td>{primera}</td></tr>')
         else:
-            rows_html += (
-                f'<tr><td>{email}</td><td>{nombre}</td>'
-                f'<td class="no">No</td><td>—</td><td>—</td></tr>'
-            )
+            rows_html += (f'<tr><td>{email}</td><td>{nombre}</td>'
+                          f'<td class="no">No</td><td>—</td><td>—</td></tr>')
 
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Reporte mailing</title>
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reporte mailing</title>
 <style>
   body{{font-family:Arial,sans-serif;margin:32px;color:#222;max-width:1100px}}
   h1{{color:#1d4ed8;margin-bottom:4px}}
@@ -135,10 +159,9 @@ def reporte():
   .no{{color:#9ca3af}}
   .badge{{background:#dcfce7;color:#065f46;border-radius:20px;padding:2px 10px;font-size:12px;font-weight:600}}
   a{{color:#1d4ed8;text-decoration:none;font-size:14px}}
-  a:hover{{text-decoration:underline}}
 </style></head><body>
 <h1>📊 Reporte de mailing</h1>
-<p class="sub">Actualizado en tiempo real · <a href="/exportar">⬇ Descargar CSV para Excel</a></p>
+<p class="sub">Actualizado en tiempo real · <a href="/exportar">⬇ Descargar CSV</a></p>
 <div class="stats">
   <div class="stat"><div class="n">{total}</div><div class="l">Enviados</div></div>
   <div class="stat"><div class="n">{abrieron}</div><div class="l">Abrieron</div></div>
@@ -148,9 +171,7 @@ def reporte():
 <table>
   <tr><th>Email</th><th>Nombre</th><th>Abrió</th><th>Veces</th><th>Primera apertura</th></tr>
   {rows_html}
-</table>
-</body></html>"""
-    return html
+</table></body></html>"""
 
 # ── Exportar CSV ──────────────────────────────────────────────────────────────
 
@@ -159,39 +180,28 @@ def exportar():
     with get_db() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT
-                    e.email,
-                    MIN(e.nombre) AS nombre,
-                    CASE WHEN COUNT(a.id) > 0 THEN 'Si' ELSE 'No' END AS abrio,
-                    COUNT(a.id) AS veces,
-                    MIN(a.abierto_en) AS primera
+                SELECT e.email, MIN(e.nombre) AS nombre,
+                       CASE WHEN COUNT(a.id) > 0 THEN 'Si' ELSE 'No' END AS abrio,
+                       COUNT(a.id) AS veces, MIN(a.abierto_en) AS primera
                 FROM envios e
                 LEFT JOIN aperturas a ON lower(e.email) = lower(a.email)
-                GROUP BY e.email
-                ORDER BY abrio DESC
+                GROUP BY e.email ORDER BY abrio DESC
             """)
             filas = cur.fetchall()
 
     out = io.StringIO()
-    w   = csv.writer(out)
+    w = csv.writer(out)
     w.writerow(["email", "nombre", "abrio", "veces", "primera_apertura"])
     for r in filas:
         primera = r["primera"].strftime("%Y-%m-%d %H:%M:%S") if r["primera"] else ""
         w.writerow([r["email"], r["nombre"], r["abrio"], r["veces"], primera])
 
-    return app.response_class(
-        out.getvalue(),
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=aperturas.csv"}
-    )
-
-# ── Health check ──────────────────────────────────────────────────────────────
+    return app.response_class(out.getvalue(), mimetype="text/csv; charset=utf-8",
+           headers={"Content-Disposition": "attachment; filename=aperturas.csv"})
 
 @app.route("/")
 def home():
-    return "Servidor de tracking activo ✓ (PostgreSQL v4)"
-
-# ── Init ──────────────────────────────────────────────────────────────────────
+    return "Servidor de tracking activo ✓ (v5 - imagen visible)"
 
 if DATABASE_URL:
     try:
