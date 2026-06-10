@@ -1,15 +1,6 @@
-"""
-SERVIDOR DE TRACKING — tracking_server.py  v3 (PostgreSQL persistente)
-La base de datos ahora vive en Supabase (gratis), no en el disco de Render.
-Así los datos NUNCA se pierden aunque el servidor se duerma o redeploya.
-
-En Render tenés que agregar una variable de entorno:
-  DATABASE_URL = (la connection string de Supabase)
-"""
-
 from flask import Flask, request, send_file, jsonify
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 import io, datetime, base64, csv, os
 
 app = Flask(__name__)
@@ -17,27 +8,25 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL)
 
 def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS envios (
-        id SERIAL PRIMARY KEY,
-        email TEXT,
-        nombre TEXT,
-        enviado_en TIMESTAMP
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS aperturas (
-        id SERIAL PRIMARY KEY,
-        email TEXT,
-        abierto_en TIMESTAMP,
-        ip TEXT,
-        user_agent TEXT
-    )""")
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS envios (
+                id SERIAL PRIMARY KEY,
+                email TEXT,
+                nombre TEXT,
+                enviado_en TIMESTAMP
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS aperturas (
+                id SERIAL PRIMARY KEY,
+                email TEXT,
+                abierto_en TIMESTAMP,
+                ip TEXT,
+                user_agent TEXT
+            )""")
+        conn.commit()
 
 # ── Pixel de tracking ─────────────────────────────────────────────────────────
 
@@ -48,16 +37,14 @@ def pixel(eid):
     except Exception:
         email = eid
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO aperturas (email, abierto_en, ip, user_agent) VALUES (%s,%s,%s,%s)",
-            (email, datetime.datetime.utcnow(),
-             request.remote_addr, request.headers.get("User-Agent", ""))
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO aperturas (email, abierto_en, ip, user_agent) VALUES (%s,%s,%s,%s)",
+                    (email, datetime.datetime.utcnow(),
+                     request.remote_addr, request.headers.get("User-Agent", ""))
+                )
+            conn.commit()
     except Exception:
         pass
     gif = bytes([
@@ -74,15 +61,13 @@ def pixel(eid):
 def registrar():
     try:
         d = request.get_json(force=True)
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO envios (email, nombre, enviado_en) VALUES (%s,%s,%s)",
-            (d.get("email",""), d.get("nombre",""), datetime.datetime.utcnow())
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO envios (email, nombre, enviado_en) VALUES (%s,%s,%s)",
+                    (d.get("email",""), d.get("nombre",""), datetime.datetime.utcnow())
+                )
+            conn.commit()
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -91,26 +76,23 @@ def registrar():
 
 @app.route("/reporte")
 def reporte():
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    with get_db() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM envios")
+            total = cur.fetchone()["c"]
 
-    cur.execute("SELECT COUNT(*) FROM envios")
-    total = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT
-            e.email,
-            MIN(e.nombre)       AS nombre,
-            COUNT(a.id)         AS veces,
-            MIN(a.abierto_en)   AS primera
-        FROM envios e
-        LEFT JOIN aperturas a ON lower(e.email) = lower(a.email)
-        GROUP BY e.email
-        ORDER BY MIN(a.abierto_en) DESC NULLS LAST
-    """)
-    filas = cur.fetchall()
-    cur.close()
-    conn.close()
+            cur.execute("""
+                SELECT
+                    e.email,
+                    MIN(e.nombre)     AS nombre,
+                    COUNT(a.id)       AS veces,
+                    MIN(a.abierto_en) AS primera
+                FROM envios e
+                LEFT JOIN aperturas a ON lower(e.email) = lower(a.email)
+                GROUP BY e.email
+                ORDER BY MIN(a.abierto_en) DESC NULLS LAST
+            """)
+            filas = cur.fetchall()
 
     abrieron = sum(1 for r in filas if r["veces"] > 0)
     no_abr   = total - abrieron
@@ -174,23 +156,21 @@ def reporte():
 
 @app.route("/exportar")
 def exportar():
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("""
-        SELECT
-            e.email,
-            MIN(e.nombre) AS nombre,
-            CASE WHEN COUNT(a.id) > 0 THEN 'Si' ELSE 'No' END AS abrio,
-            COUNT(a.id) AS veces,
-            MIN(a.abierto_en) AS primera
-        FROM envios e
-        LEFT JOIN aperturas a ON lower(e.email) = lower(a.email)
-        GROUP BY e.email
-        ORDER BY abrio DESC
-    """)
-    filas = cur.fetchall()
-    cur.close()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT
+                    e.email,
+                    MIN(e.nombre) AS nombre,
+                    CASE WHEN COUNT(a.id) > 0 THEN 'Si' ELSE 'No' END AS abrio,
+                    COUNT(a.id) AS veces,
+                    MIN(a.abierto_en) AS primera
+                FROM envios e
+                LEFT JOIN aperturas a ON lower(e.email) = lower(a.email)
+                GROUP BY e.email
+                ORDER BY abrio DESC
+            """)
+            filas = cur.fetchall()
 
     out = io.StringIO()
     w   = csv.writer(out)
@@ -209,7 +189,7 @@ def exportar():
 
 @app.route("/")
 def home():
-    return "Servidor de tracking activo ✓ (PostgreSQL)"
+    return "Servidor de tracking activo ✓ (PostgreSQL v4)"
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
